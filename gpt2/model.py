@@ -1,4 +1,5 @@
 import math
+import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -98,7 +99,7 @@ class GPT(nn.Module):
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.size()
 
         pos = torch.arange(0, T, device=idx.device)
@@ -112,27 +113,75 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
-        return logits
+        loss = None
+
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, loss
 
 
-num_return_sequences = 5
-max_length = 30
+class DataLoader:
+
+    def __init__(self, B, T):
+
+        self.B = B
+        self.T = T
+
+        with open("../input.txt", "r", encoding="utf-8") as f:
+            text = f.read()
+
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+
+        self.curr_pos = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+
+        buf = self.tokens[self.curr_pos : self.curr_pos + B * T + 1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+
+        self.curr_pos += B * T
+
+        if self.curr_pos + (B * T + 1) > len(self.tokens):
+            self.curr_pos = 0
+
+        return x, y
+
 
 device = "cuda"
-model = GPT(GPTConfig())
 
-model.eval()
+train_loader = DataLoader(4, 36)
+
+model = GPT(GPTConfig())
 model.to(device)
 
 
-import tiktoken
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
 
-enc = tiktoken.get_encoding("gpt2")
+
+import sys
+
+sys.exit(0)
+
+model.eval()
+num_return_sequences = 5
+max_length = 30
 tokens = enc.encode("Hello, I'm a language model")
 tokens = torch.tensor(tokens, dtype=torch.long)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
 x = tokens.to(device)
-
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
