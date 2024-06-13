@@ -1,4 +1,6 @@
 asttokens==2.4.1
+certifi==2024.6.2
+charset-normalizer==3.3.2
 comm==0.2.2
 contourpy==1.2.1
 cycler==0.12.1
@@ -9,6 +11,7 @@ filelock==3.14.0
 fonttools==4.53.0
 fsspec==2024.6.0
 graphviz==0.20.3
+idna==3.7
 ipykernel==6.29.4
 ipython==8.25.0
 jedi==0.19.1
@@ -48,12 +51,16 @@ Pygments==2.18.0
 pyparsing==3.1.2
 python-dateutil==2.9.0.post0
 pyzmq==26.0.3
+regex==2024.5.15
+requests==2.32.3
 six==1.16.0
 stack-data==0.6.3
 sympy==1.12.1
+tiktoken==0.7.0
 torch==2.3.1
 tornado==6.4.1
 traitlets==5.14.3
 triton==2.3.1
 typing_extensions==4.12.2
+urllib3==2.2.1
 wcwidth==0.2.13
