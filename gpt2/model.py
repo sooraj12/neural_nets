@@ -162,6 +162,7 @@ class GPT(nn.Module):
 
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and "cuda" in device
+        print(f"Using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(
             optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
         )
@@ -205,7 +206,12 @@ device = "cuda" if torch.cuda.is_available() else "cup"
 torch.manual_seed(1337)
 torch.cuda.manual_seed(1337)
 
-train_loader = DataLoader(16, 1024)
+total_batch_size = 524288
+B = 16
+T = 1024
+grad_accum_steps = total_batch_size // (B * T)
+
+train_loader = DataLoader(B=B, T=T)
 
 # torch.set_float32_matmul_precision("high") #TODO: enable on TF32 supported gpus
 
@@ -240,14 +246,24 @@ optimizer = model.configure_optimizer(
 
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
+    loss_accum = 0.0
 
-    # with torch.autocast(device_type=device, dtype=torch.bfloat16): #TODO: enable on bfloat16 supported gpus
-    logits, loss = model(x, y)
+    for micro_step in range(grad_accum_steps):
 
-    loss.backward()
+        y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+
+        # TODO: enable on bfloat16 supported gpus(ampere)
+        # with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        # TODO: enable to use mixed pricision tensor calulation on volta
+        # with torch.autocast(device_type=device)
+        logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+
+        loss.backward()
+
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -257,9 +273,9 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
-    tokens_per_sec = train_loader.B * train_loader.T
+    tokens_per_sec = train_loader.B * train_loader.T * grad_accum_steps / dt
     print(
-        f"step {step}, loss: {loss.item():.6f}, norm: {norm:.4f},  dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_sec/dt:.2f}"
+        f"step {step}, loss: {loss_accum.item():.6f}, norm: {norm:.4f},  dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_sec:.2f}"
     )
 
 
