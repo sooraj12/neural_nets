@@ -11,7 +11,7 @@ from dataclasses import dataclass
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304
+    vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -42,11 +42,12 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        # att = F.softmax(att, dim=-1)
-        # y = att @ v
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        y = att @ v
+        # flash attention(implements the above four line very efficiently)
+        # y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -178,14 +179,13 @@ device = "cuda" if torch.cuda.is_available() else "cup"
 torch.manual_seed(1337)
 torch.cuda.manual_seed(1337)
 
-# 16, 1024
-train_loader = DataLoader(4, 8)
+train_loader = DataLoader(16, 1024)
 
 # torch.set_float32_matmul_precision("high")
 
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-# model = torch.compile(model)
+model = torch.compile(model)
 
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
@@ -199,14 +199,14 @@ for i in range(50):
     logits, loss = model(x, y)
 
     loss.backward()
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
     print(
-        f"step {i}, loss: {loss.item()}, norm: {norm:.4f},  dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}"
+        f"step {i}, loss: {loss.item()}, norm: {0:.4f},  dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}"
     )
 
 
