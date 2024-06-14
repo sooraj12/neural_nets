@@ -11,6 +11,8 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
+# from torch.cuda.amp import GradScaler, autocast
+
 from dataclasses import dataclass
 
 
@@ -208,6 +210,7 @@ class DataLoader:
 
 
 ddp = int(os.environ.get("RANK", -1)) != -1
+# scaler = GradScaler()
 
 if ddp:
     init_process_group(backend="nccl")
@@ -291,7 +294,8 @@ for step in range(max_steps):
         # TODO: enable on bfloat16 supported gpus(ampere)
         # with torch.autocast(device_type=device, dtype=torch.bfloat16):
         # TODO: enable to use mixed pricision tensor calulation on volta
-        # with torch.autocast(device_type=device)
+        # with torch.autocast():
+        # with autocast():
         logits, loss = model(x, y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
@@ -300,6 +304,7 @@ for step in range(max_steps):
             model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
 
         loss.backward()
+        # scaler.scale(loss).backward()
 
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
@@ -310,6 +315,9 @@ for step in range(max_steps):
         param_group["lr"] = lr
 
     optimizer.step()
+    # scaler.step(optimizer)
+    # scaler.update()
+
     torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
