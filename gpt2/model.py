@@ -42,12 +42,14 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v
+
         # flash attention(implements the above four line very efficiently)
-        # y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # this will be pickedup by torch compile
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -181,7 +183,7 @@ torch.cuda.manual_seed(1337)
 
 train_loader = DataLoader(16, 1024)
 
-# torch.set_float32_matmul_precision("high")
+# torch.set_float32_matmul_precision("high") #TODO: enable on TF32 supported gpus
 
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
@@ -195,18 +197,18 @@ for i in range(50):
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
 
-    # with torch.autocast(device_type=device, dtype=torch.bfloat16):
+    # with torch.autocast(device_type=device, dtype=torch.bfloat16): #TODO: enable on bfloat16 supported gpus
     logits, loss = model(x, y)
 
     loss.backward()
-    # norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
-    dt = (t1 - t0) * 1000
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    dt = t1 - t0
+    tokens_per_sec = train_loader.B * train_loader.T
     print(
-        f"step {i}, loss: {loss.item()}, norm: {0:.4f},  dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}"
+        f"step {i}, loss: {loss.item():.6f}, norm: {norm:.4f},  dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_sec/dt:.2f}"
     )
 
 
