@@ -11,10 +11,10 @@ from torch.nn import functional as F
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from dataclasses import dataclass
+from gpt2.eval import render_example, iterate_examples
 
 # from torch.cuda.amp import GradScaler, autocast
-
-from dataclasses import dataclass
 
 
 @dataclass
@@ -30,18 +30,19 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config: GPTConfig):
         super().__init__()
+        assert config.n_embd % config.n_head == 0
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                1, 1, config.block_size, config.block_size
-            ),
-        )
+        # self.register_buffer(
+        #     "bias",
+        #     torch.tril(torch.ones(config.block_size, config.block_size)).view(
+        #         1, 1, config.block_size, config.block_size
+        #     ),
+        # )
 
     def forward(self, x):
         B, T, C = x.size()
@@ -153,7 +154,7 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def configure_optimizer(self, weight_decay, learning_rate, device):
+    def configure_optimizer(self, weight_decay, learning_rate, device_type):
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
@@ -168,7 +169,7 @@ class GPT(nn.Module):
         # num_nodecay_params = sum(p.numel() for p in nodecay_params)
 
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and "cuda" in device
+        use_fused = fused_available and "cuda" in device_type
         print(f"Using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(
             optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
@@ -179,7 +180,7 @@ class GPT(nn.Module):
 
 def load_tokens(filename):
     npt = np.load(filename)
-    npt = npt.astype(np.int32)  # added after video
+    npt = npt.astype(np.int32)
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
 
@@ -192,6 +193,7 @@ class DataLoader:
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {"train", "val"}
 
         data_root = "edu_fineweb10B"
         shards = os.listdir(data_root)
@@ -199,6 +201,7 @@ class DataLoader:
         shards = sorted(shards)
         shards = [os.path.join(data_root, s) for s in shards]
         self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
 
@@ -226,6 +229,10 @@ class DataLoader:
         return x, y
 
 
+def get_most_likely_row(tokens, mask, logits):
+    pass
+
+
 ddp = int(os.environ.get("RANK", -1)) != -1
 # scaler = GradScaler()
 
@@ -242,12 +249,22 @@ else:
     ddp_local_rank = 0
     ddp_world_size = 1
     master_process = True
-    device = "cuda" if torch.cuda.is_available() else "cup"
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
+
+enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288
 B = 8
@@ -278,6 +295,8 @@ model.to(device)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+raw_model = model.module if ddp else model
+
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -300,19 +319,21 @@ def get_lr(it):
 
 
 optimizer = model.module.configure_optimizer(
-    weight_decay=0.1, learning_rate=max_lr, device=device
+    weight_decay=0.1, learning_rate=max_lr, device_type=device_type
 )
-enc = tiktoken.get_encoding("gpt2")
 
 
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f:  # open for writing to clear the file
+    pass
 
 for step in range(max_steps):
     t0 = time.time()
+    last_step = step == max_steps - 1
 
-    if step % 100 == 0:
+    if step % 250 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -332,8 +353,53 @@ for step in range(max_steps):
 
             if master_process:
                 print(f"Validation Loss: {val_loss_accum.item():.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                if step > 0 and (step % 5000 == 0 or last_step):
+                    # optionally write model checkpoints
+                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                    checkpoint = {
+                        "model": raw_model.state_dict(),
+                        "config": raw_model.config,
+                        "step": step,
+                        "val_loss": val_loss_accum.item(),
+                    }
+                torch.save(checkpoint, checkpoint_path)
 
-    if step > 0 and step % 100 == 0:
+    # once in a while evaluate hellaswag
+    if step % 250 == 0 or last_step:
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            if i % ddp_world_size != ddp_rank:
+                continue
+
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            with torch.no_grad():
+                logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+            if ddp:
+                num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+                num_correct_norm = torch.tensor(
+                    num_correct_norm, dtype=torch.long, device=device
+                )
+                dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+                dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+                num_total = num_total.item()
+                num_correct_norm = num_correct_norm.item()
+            acc_norm = num_correct_norm / num_total
+            if master_process:
+                print(
+                    f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}"
+                )
+                with open(log_file, "a") as f:
+                    f.write(f"{step} hella {acc_norm:.4f}\n")
+
+    if (step > 0 and step % 250 == 0) or last_step:
         model.eval()
         num_return_sequences = 4
         max_length = 32
