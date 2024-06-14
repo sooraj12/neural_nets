@@ -1,6 +1,7 @@
 asttokens==2.4.1
 certifi==2024.6.2
 charset-normalizer==3.3.2
+cmake==3.29.5.1
 comm==0.2.2
 contourpy==1.2.1
 cycler==0.12.1
