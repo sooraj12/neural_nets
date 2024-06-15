@@ -485,6 +485,7 @@ for step in range(max_steps):
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
+    scaler.unscale_(optimizer)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
