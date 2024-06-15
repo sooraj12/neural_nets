@@ -210,33 +210,53 @@ class DataLoader:
     def reset(self):
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
-        self.curr_pos = self.B * self.T * self.process_rank
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
 
-        buf = self.tokens[self.curr_pos : self.curr_pos + B * T + 1]
-        x = buf[:-1].view(B, T)
-        y = buf[1:].view(B, T)
-
-        self.curr_pos += B * T * self.num_processes
-
-        if self.curr_pos + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.tokens)
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        x = (buf[:-1]).view(B, T)  # inputs
+        y = (buf[1:]).view(B, T)  # targets
+        # advance the position in the tensor
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds, advance to next shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
-            self.curr_pos = B * T * self.process_rank
-
+            self.current_position = B * T * self.process_rank
         return x, y
 
 
 def get_most_likely_row(tokens, mask, logits):
-    pass
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(
+        flat_shift_logits, flat_shift_tokens, reduction="none"
+    )
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (
+        mask[..., 1:]
+    ).contiguous()  # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
 
 
 ddp = int(os.environ.get("RANK", -1)) != -1
 # scaler = GradScaler()
 
 if ddp:
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
     init_process_group(backend="nccl")
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
@@ -249,6 +269,7 @@ else:
     ddp_local_rank = 0
     ddp_world_size = 1
     master_process = True
+    # attempt to autodetect device
     device = "cpu"
     if torch.cuda.is_available():
         device = "cuda"
@@ -267,7 +288,9 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288
+# 16(default), 32, 64 for a100
 B = 8
+# 2048(gpt2)
 T = 1024
 assert (
     total_batch_size % (B * T * ddp_world_size) == 0
@@ -298,7 +321,7 @@ if ddp:
 raw_model = model.module if ddp else model
 
 
-max_lr = 6e-4
+max_lr = 6e-4 * 3
 min_lr = max_lr * 0.1
 warmup_steps = 715
 max_steps = 19073
@@ -318,7 +341,7 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 
-optimizer = model.module.configure_optimizer(
+optimizer = raw_model.configure_optimizer(
     weight_decay=0.1, learning_rate=max_lr, device_type=device_type
 )
 
@@ -333,6 +356,7 @@ for step in range(max_steps):
     t0 = time.time()
     last_step = step == max_steps - 1
 
+    # evaluate model
     if step % 250 == 0 or last_step:
         model.eval()
         val_loader.reset()
@@ -397,11 +421,12 @@ for step in range(max_steps):
             with open(log_file, "a") as f:
                 f.write(f"{step} hella {acc_norm:.4f}\n")
 
+    # sample from model
     if (step > 0 and step % 250 == 0) or last_step:
         model.eval()
         num_return_sequences = 4
         max_length = 32
-        tokens = enc.encode("Hello, I'm a language model")
+        tokens = enc.encode("Hello, I'm a language model,")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device)
@@ -411,16 +436,19 @@ for step in range(max_steps):
         while xgen.size(1) < max_length:
             with torch.no_grad():
 
-                logits = model(xgen)
-                logits = logits[:, -1, :]
+                logits, loss = model(xgen)
+                logits = logits[:, -1, :]  # (B, vocab_size)
+                # get the probabilities
                 probs = F.softmax(logits, dim=-1)
-
+                # do top-k sampling of 50 (huggingface pipeline default)
+                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
                 topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-
-                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
-
-                xcol = torch.gather(topk_indices, -1, ix)
-
+                # select a token from the top-k probabilities
+                # note: multinomial does not demand the input to sum to 1
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)  # (B, 1)
+                # gather the corresponding indices
+                xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
+                # append to the sequence
                 xgen = torch.cat((xgen, xcol), dim=1)
 
         for i in range(num_return_sequences):
