@@ -322,7 +322,7 @@ val_loader = DataLoader(
 # load pretrained model weights(checkpoints)
 model_weights_path = os.path.join("log", "gpt2_v1_10000.pt")
 checkpoint = torch.load(model_weights_path, map_location="cpu")
-csd = checkpoint["model"].float().state_dict()  # checkpoint state_dict as FP32
+csd = checkpoint["model"]
 model = GPT(GPTConfig(vocab_size=50304)).to(device)
 model.load_state_dict(csd, strict=False)
 if ddp:
@@ -364,7 +364,7 @@ with open(log_file, "w") as f:  # open for writing to clear the file
 
 scaler = GradScaler()
 
-for step in range(max_steps):
+for step in range(checkpoint["step"], max_steps):
     t0 = time.time()
     last_step = step == max_steps - 1
 
