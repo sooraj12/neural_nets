@@ -311,9 +311,20 @@ val_loader = DataLoader(
 # torch.set_float32_matmul_precision("high") #TODO: enable on TF32 supported gpus
 
 # create model
-model = GPT(GPTConfig(vocab_size=50304))
-model.to(device)
-# model = torch.compile(model)
+# model = GPT(GPTConfig(vocab_size=50304))
+# model.to(device)
+# # model = torch.compile(model)
+# if ddp:
+#     model = DDP(model, device_ids=[ddp_local_rank])
+
+# raw_model = model.module if ddp else model
+
+# load pretrained model weights(checkpoints)
+model_weights_path = os.path.join("log", "gpt2_v1_10000.pt")
+checkpoint = torch.load(model_weights_path, map_location="cpu")
+csd = checkpoint["model"].float().state_dict()  # checkpoint state_dict as FP32
+model = GPT(GPTConfig(vocab_size=50304)).to(device)
+model.load_state_dict(csd, strict=False)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
